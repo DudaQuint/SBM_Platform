@@ -1,0 +1,14 @@
+# Build artifacts
+**/x64/
+**/Debug/
+**/Release/
+**/intermediate/
+**/.vs/
+*.obj
+*.pch
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.user
+*.suo
