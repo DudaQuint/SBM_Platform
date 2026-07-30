@@ -21,7 +21,7 @@ See `VERSION` for the current platform release identifier.
 ```
 include/sbm/     Public headers
 src/             Shared translation units linked into each service EXE
-VERSION          Platform release (e.g. 1.2610.191.18)
+VERSION          Platform release (e.g. 1.2610.191.19)
 ```
 
 ## Modules
