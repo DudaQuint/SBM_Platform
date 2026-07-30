@@ -21,7 +21,7 @@ See `VERSION` for the current platform release identifier.
 ```
 include/sbm/     Public headers
 src/             Shared translation units linked into each service EXE
-VERSION          Platform release (e.g. 1.2610.191.1)
+VERSION          Platform release (e.g. 1.2610.191.17)
 ```
 
 ## Modules
@@ -34,6 +34,8 @@ VERSION          Platform release (e.g. 1.2610.191.1)
 | **odbc_connection** | `odbc_connection.hpp` / `.cpp` | ODBC3 environment + connection + stmt alloc/timeout |
 | **sql_connection** | `sql_connection.hpp` / `.cpp` | `sql_connection_config` + ODBC string builders |
 | **scm_status** | `scm_status.hpp` | `SERVICE_STATUS` state helper |
+| **interruptible_wait** | `interruptible_wait.hpp` | Stop-event / `stop_token` waits for retry & poll loops |
+| **log** | `log.hpp` | Optional severity facade (`set_sink`); services keep Boost/Event Log backends |
 
 ### crypto_utils
 
