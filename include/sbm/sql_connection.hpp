@@ -17,6 +17,7 @@ struct sql_connection_config {
   bool encrypt = false;
   bool trust_server_certificate = true;
   std::optional<std::wstring> username;
+  // Move-only secret; makes sql_connection_config move-only as well.
   std::optional<sbm::security::secure_wstring> password;
   std::wstring security_status;
 };

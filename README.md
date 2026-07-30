@@ -21,7 +21,7 @@ See `VERSION` for the current platform release identifier.
 ```
 include/sbm/     Public headers
 src/             Shared translation units linked into each service EXE
-VERSION          Platform release (e.g. 1.2610.191.17)
+VERSION          Platform release (e.g. 1.2610.191.18)
 ```
 
 ## Modules
@@ -42,6 +42,7 @@ VERSION          Platform release (e.g. 1.2610.191.17)
 - **Write format:** `gcm:IV:TAG:CIPHERTEXT` (hex segments)
 - **Read formats:** GCM (canonical), legacy AES-CBC (`IV:CIPHER`), legacy Watchdog DPAPI (hex blob)
 - **Key:** `HMAC-SHA256(DPAPI LocalMachine secret, MachineGuid)` with legacy `SHA256(MachineGuid)` decrypt fallback
+- **Secrets:** `secure_string` / `secure_wstring` are move-only; OpenSSL `EVP_CIPHER_CTX` uses RAII (`unique_ptr`)
 
 ### MSBuild integration
 

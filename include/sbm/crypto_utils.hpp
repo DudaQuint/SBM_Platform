@@ -13,14 +13,16 @@ constexpr size_t AES_GCM_TAG_BYTES = 16;
 
 void secure_zero_memory(void *ptr, size_t size);
 
+// Move-only secret buffer. Copy is deleted so plaintext is not silently
+// duplicated; move-assign / destructor wipe the prior backing store.
 class secure_string {
 public:
   secure_string() = default;
   explicit secure_string(std::string s);
   ~secure_string();
 
-  secure_string(const secure_string &other);
-  secure_string &operator=(const secure_string &other);
+  secure_string(const secure_string &) = delete;
+  secure_string &operator=(const secure_string &) = delete;
 
   secure_string(secure_string &&other) noexcept;
   secure_string &operator=(secure_string &&other) noexcept;
@@ -33,15 +35,15 @@ private:
 };
 
 // Wide counterpart for ODBC connection strings and SQL passwords held in memory.
-// Destructor / clear / move-assign zeroize the backing buffer.
+// Move-only; destructor / clear / move-assign zeroize the backing buffer.
 class secure_wstring {
 public:
   secure_wstring() = default;
   explicit secure_wstring(std::wstring s);
   ~secure_wstring();
 
-  secure_wstring(const secure_wstring &other);
-  secure_wstring &operator=(const secure_wstring &other);
+  secure_wstring(const secure_wstring &) = delete;
+  secure_wstring &operator=(const secure_wstring &) = delete;
 
   secure_wstring(secure_wstring &&other) noexcept;
   secure_wstring &operator=(secure_wstring &&other) noexcept;

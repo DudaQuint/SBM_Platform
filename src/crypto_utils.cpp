@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <memory>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -41,6 +42,22 @@ void wipe_vector(std::vector<unsigned char> &v) noexcept {
   }
   v.clear();
   v.shrink_to_fit();
+}
+
+struct evp_cipher_ctx_deleter {
+  void operator()(EVP_CIPHER_CTX *ctx) const noexcept {
+    EVP_CIPHER_CTX_free(ctx);
+  }
+};
+
+using evp_ctx_ptr = std::unique_ptr<EVP_CIPHER_CTX, evp_cipher_ctx_deleter>;
+
+[[nodiscard]] evp_ctx_ptr make_evp_ctx() {
+  evp_ctx_ptr ctx(EVP_CIPHER_CTX_new());
+  if (!ctx) {
+    throw std::runtime_error("EVP_CIPHER_CTX_new failed");
+  }
+  return ctx;
 }
 
 std::string wide_to_utf8(const std::wstring &w) {
@@ -165,14 +182,10 @@ std::string decrypt_cbc_legacy(const std::string &encrypted_format,
     throw std::runtime_error("Invalid IV size");
   }
 
-  EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-  if (!ctx) {
-    throw std::runtime_error("EVP_CIPHER_CTX_new failed");
-  }
+  auto ctx = make_evp_ctx();
 
-  if (1 != EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), nullptr, key.data(),
+  if (1 != EVP_DecryptInit_ex(ctx.get(), EVP_aes_256_cbc(), nullptr, key.data(),
                               iv.data())) {
-    EVP_CIPHER_CTX_free(ctx);
     throw std::runtime_error("EVP_DecryptInit_ex failed");
   }
 
@@ -180,24 +193,22 @@ std::string decrypt_cbc_legacy(const std::string &encrypted_format,
   int len = 0;
   int plaintext_len = 0;
 
-  if (1 != EVP_DecryptUpdate(ctx, plaintext.data(), &len, ciphertext.data(),
+  if (1 != EVP_DecryptUpdate(ctx.get(), plaintext.data(), &len, ciphertext.data(),
                              static_cast<int>(ciphertext.size()))) {
     wipe_vector(plaintext);
-    EVP_CIPHER_CTX_free(ctx);
     throw std::runtime_error("EVP_DecryptUpdate failed");
   }
   plaintext_len = len;
 
-  if (1 != EVP_DecryptFinal_ex(ctx, plaintext.data() + len, &len)) {
+  if (1 != EVP_DecryptFinal_ex(ctx.get(), plaintext.data() + len, &len)) {
     wipe_vector(plaintext);
-    EVP_CIPHER_CTX_free(ctx);
     throw std::runtime_error(
         "Decryption failed (CBC padding check failed). Ensure this is the "
         "same machine where encryption occurred.");
   }
   plaintext_len += len;
   plaintext.resize(static_cast<size_t>(plaintext_len));
-  EVP_CIPHER_CTX_free(ctx);
+  ctx.reset();
 
   std::string out(plaintext.begin(), plaintext.end());
   wipe_vector(plaintext);
@@ -230,16 +241,12 @@ std::string decrypt_gcm(const std::string &encrypted_format,
     throw std::runtime_error("Invalid GCM tag size");
   }
 
-  EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-  if (!ctx) {
-    throw std::runtime_error("EVP_CIPHER_CTX_new failed");
-  }
+  auto ctx = make_evp_ctx();
 
-  if (1 != EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr,
+  if (1 != EVP_DecryptInit_ex(ctx.get(), EVP_aes_256_gcm(), nullptr, nullptr,
                               nullptr) ||
-      1 != EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, IV_LEN, nullptr) ||
-      1 != EVP_DecryptInit_ex(ctx, nullptr, nullptr, key.data(), iv.data())) {
-    EVP_CIPHER_CTX_free(ctx);
+      1 != EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_GCM_SET_IVLEN, IV_LEN, nullptr) ||
+      1 != EVP_DecryptInit_ex(ctx.get(), nullptr, nullptr, key.data(), iv.data())) {
     throw std::runtime_error("EVP_DecryptInit_ex (GCM) failed");
   }
 
@@ -248,25 +255,23 @@ std::string decrypt_gcm(const std::string &encrypted_format,
   int plaintext_len = 0;
 
   if (!ciphertext.empty()) {
-    if (1 != EVP_DecryptUpdate(ctx, plaintext.data(), &len, ciphertext.data(),
+    if (1 != EVP_DecryptUpdate(ctx.get(), plaintext.data(), &len, ciphertext.data(),
                                static_cast<int>(ciphertext.size()))) {
       wipe_vector(plaintext);
-      EVP_CIPHER_CTX_free(ctx);
       throw std::runtime_error("EVP_DecryptUpdate (GCM) failed");
     }
     plaintext_len = len;
   }
 
-  if (1 != EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, TAG_LEN,
+  if (1 != EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_GCM_SET_TAG, TAG_LEN,
                                const_cast<unsigned char *>(tag.data()))) {
     wipe_vector(plaintext);
-    EVP_CIPHER_CTX_free(ctx);
     throw std::runtime_error("EVP_CIPHER_CTX_ctrl(SET_TAG) failed");
   }
 
   const int rc =
-      EVP_DecryptFinal_ex(ctx, plaintext.data() + plaintext_len, &len);
-  EVP_CIPHER_CTX_free(ctx);
+      EVP_DecryptFinal_ex(ctx.get(), plaintext.data() + plaintext_len, &len);
+  ctx.reset();
   if (rc != 1) {
     wipe_vector(plaintext);
     throw std::runtime_error(
@@ -453,18 +458,6 @@ secure_string::~secure_string() {
   }
 }
 
-secure_string::secure_string(const secure_string &other) : data_(other.data_) {}
-
-secure_string &secure_string::operator=(const secure_string &other) {
-  if (this != &other) {
-    if (!data_.empty()) {
-      secure_zero_memory(&data_[0], data_.size());
-    }
-    data_ = other.data_;
-  }
-  return *this;
-}
-
 secure_string::secure_string(secure_string &&other) noexcept
     : data_(std::move(other.data_)) {}
 
@@ -484,18 +477,6 @@ secure_wstring::~secure_wstring() {
   if (!data_.empty()) {
     secure_zero_memory(&data_[0], data_.size() * sizeof(wchar_t));
   }
-}
-
-secure_wstring::secure_wstring(const secure_wstring &other) : data_(other.data_) {}
-
-secure_wstring &secure_wstring::operator=(const secure_wstring &other) {
-  if (this != &other) {
-    if (!data_.empty()) {
-      secure_zero_memory(&data_[0], data_.size() * sizeof(wchar_t));
-    }
-    data_ = other.data_;
-  }
-  return *this;
 }
 
 secure_wstring::secure_wstring(secure_wstring &&other) noexcept
@@ -572,16 +553,12 @@ std::string encrypt_string(const std::string &plaintext,
     throw std::runtime_error("RAND_bytes failed");
   }
 
-  EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-  if (!ctx) {
-    throw std::runtime_error("EVP_CIPHER_CTX_new failed");
-  }
+  auto ctx = make_evp_ctx();
 
-  if (1 != EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr,
+  if (1 != EVP_EncryptInit_ex(ctx.get(), EVP_aes_256_gcm(), nullptr, nullptr,
                               nullptr) ||
-      1 != EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, IV_LEN, nullptr) ||
-      1 != EVP_EncryptInit_ex(ctx, nullptr, nullptr, key.data(), iv.data())) {
-    EVP_CIPHER_CTX_free(ctx);
+      1 != EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_GCM_SET_IVLEN, IV_LEN, nullptr) ||
+      1 != EVP_EncryptInit_ex(ctx.get(), nullptr, nullptr, key.data(), iv.data())) {
     throw std::runtime_error("EVP_EncryptInit_ex failed: " + get_openssl_error());
   }
 
@@ -591,18 +568,16 @@ std::string encrypt_string(const std::string &plaintext,
 
   if (!plaintext.empty()) {
     if (1 != EVP_EncryptUpdate(
-                 ctx, ciphertext.data(), &len,
+                 ctx.get(), ciphertext.data(), &len,
                  reinterpret_cast<const unsigned char *>(plaintext.data()),
                  static_cast<int>(plaintext.size()))) {
-      EVP_CIPHER_CTX_free(ctx);
       throw std::runtime_error("EVP_EncryptUpdate failed: " +
                                get_openssl_error());
     }
     ciphertext_len = len;
   }
 
-  if (1 != EVP_EncryptFinal_ex(ctx, ciphertext.data() + ciphertext_len, &len)) {
-    EVP_CIPHER_CTX_free(ctx);
+  if (1 != EVP_EncryptFinal_ex(ctx.get(), ciphertext.data() + ciphertext_len, &len)) {
     throw std::runtime_error("EVP_EncryptFinal_ex failed: " +
                              get_openssl_error());
   }
@@ -610,11 +585,10 @@ std::string encrypt_string(const std::string &plaintext,
   ciphertext.resize(static_cast<size_t>(ciphertext_len));
 
   std::vector<unsigned char> tag(static_cast<size_t>(TAG_LEN));
-  if (1 != EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, TAG_LEN, tag.data())) {
-    EVP_CIPHER_CTX_free(ctx);
+  if (1 != EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_GCM_GET_TAG, TAG_LEN, tag.data())) {
     throw std::runtime_error("EVP_CIPHER_CTX_ctrl(GET_TAG) failed");
   }
-  EVP_CIPHER_CTX_free(ctx);
+  ctx.reset();
 
   return std::string(k_gcm_prefix) + to_hex(iv.data(), iv.size()) + ":" +
          to_hex(tag.data(), tag.size()) + ":" +
