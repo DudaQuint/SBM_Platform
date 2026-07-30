@@ -5,9 +5,12 @@
 
 #include <openssl/err.h>
 #include <openssl/evp.h>
+#include <openssl/hmac.h>
 #include <openssl/rand.h>
 #include <openssl/sha.h>
 
+#include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <optional>
 #include <sstream>
@@ -19,6 +22,26 @@
 
 namespace sbm::security {
 namespace {
+
+namespace fs = std::filesystem;
+
+#ifndef CRYPT_PROTECT_LOCAL_MACHINE
+#define CRYPT_PROTECT_LOCAL_MACHINE 0x00000004
+#endif
+
+void wipe_buffer(void *ptr, const size_t size) noexcept {
+  if (ptr && size > 0) {
+    SecureZeroMemory(ptr, size);
+  }
+}
+
+void wipe_vector(std::vector<unsigned char> &v) noexcept {
+  if (!v.empty()) {
+    wipe_buffer(v.data(), v.size());
+  }
+  v.clear();
+  v.shrink_to_fit();
+}
 
 std::string wide_to_utf8(const std::wstring &w) {
   if (w.empty()) {
@@ -79,8 +102,50 @@ std::optional<std::string> try_decrypt_dpapi(const std::vector<unsigned char> &c
   }
 
   std::string plaintext(reinterpret_cast<char *>(output.pbData), output.cbData);
+  // Zeroize DPAPI plaintext before returning the heap to the allocator.
+  wipe_buffer(output.pbData, output.cbData);
   LocalFree(output.pbData);
   return plaintext;
+}
+
+std::optional<std::vector<unsigned char>>
+try_unprotect_dpapi_bytes(const std::vector<unsigned char> &cipher_bytes,
+                          const DWORD flags) {
+  DATA_BLOB input{};
+  input.pbData = const_cast<BYTE *>(cipher_bytes.data());
+  input.cbData = static_cast<DWORD>(cipher_bytes.size());
+
+  DATA_BLOB output{};
+  if (!CryptUnprotectData(&input, nullptr, nullptr, nullptr, nullptr, flags,
+                          &output)) {
+    return std::nullopt;
+  }
+
+  std::vector<unsigned char> plain(output.pbData, output.pbData + output.cbData);
+  wipe_buffer(output.pbData, output.cbData);
+  LocalFree(output.pbData);
+  return plain;
+}
+
+std::vector<unsigned char>
+protect_dpapi_bytes(const std::vector<unsigned char> &plain, const DWORD flags) {
+  DATA_BLOB input{};
+  input.pbData = const_cast<BYTE *>(plain.data());
+  input.cbData = static_cast<DWORD>(plain.size());
+
+  DATA_BLOB output{};
+  if (!CryptProtectData(&input, L"SBM machine AES key material", nullptr,
+                        nullptr, nullptr, flags, &output)) {
+    throw std::runtime_error(
+        "CryptProtectData failed while protecting machine key material. "
+        "Win32=" +
+        std::to_string(GetLastError()));
+  }
+
+  std::vector<unsigned char> blob(output.pbData, output.pbData + output.cbData);
+  wipe_buffer(output.pbData, output.cbData);
+  LocalFree(output.pbData);
+  return blob;
 }
 
 std::string decrypt_cbc_legacy(const std::string &encrypted_format,
@@ -117,12 +182,14 @@ std::string decrypt_cbc_legacy(const std::string &encrypted_format,
 
   if (1 != EVP_DecryptUpdate(ctx, plaintext.data(), &len, ciphertext.data(),
                              static_cast<int>(ciphertext.size()))) {
+    wipe_vector(plaintext);
     EVP_CIPHER_CTX_free(ctx);
     throw std::runtime_error("EVP_DecryptUpdate failed");
   }
   plaintext_len = len;
 
   if (1 != EVP_DecryptFinal_ex(ctx, plaintext.data() + len, &len)) {
+    wipe_vector(plaintext);
     EVP_CIPHER_CTX_free(ctx);
     throw std::runtime_error(
         "Decryption failed (CBC padding check failed). Ensure this is the "
@@ -132,7 +199,9 @@ std::string decrypt_cbc_legacy(const std::string &encrypted_format,
   plaintext.resize(static_cast<size_t>(plaintext_len));
   EVP_CIPHER_CTX_free(ctx);
 
-  return std::string(plaintext.begin(), plaintext.end());
+  std::string out(plaintext.begin(), plaintext.end());
+  wipe_vector(plaintext);
+  return out;
 }
 
 std::string decrypt_gcm(const std::string &encrypted_format,
@@ -181,6 +250,7 @@ std::string decrypt_gcm(const std::string &encrypted_format,
   if (!ciphertext.empty()) {
     if (1 != EVP_DecryptUpdate(ctx, plaintext.data(), &len, ciphertext.data(),
                                static_cast<int>(ciphertext.size()))) {
+      wipe_vector(plaintext);
       EVP_CIPHER_CTX_free(ctx);
       throw std::runtime_error("EVP_DecryptUpdate (GCM) failed");
     }
@@ -189,6 +259,7 @@ std::string decrypt_gcm(const std::string &encrypted_format,
 
   if (1 != EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, TAG_LEN,
                                const_cast<unsigned char *>(tag.data()))) {
+    wipe_vector(plaintext);
     EVP_CIPHER_CTX_free(ctx);
     throw std::runtime_error("EVP_CIPHER_CTX_ctrl(SET_TAG) failed");
   }
@@ -197,6 +268,7 @@ std::string decrypt_gcm(const std::string &encrypted_format,
       EVP_DecryptFinal_ex(ctx, plaintext.data() + plaintext_len, &len);
   EVP_CIPHER_CTX_free(ctx);
   if (rc != 1) {
+    wipe_vector(plaintext);
     throw std::runtime_error(
         "Decryption failed (GCM authentication check failed). The credential "
         "blob was tampered with, or this is not the machine where it was "
@@ -205,14 +277,13 @@ std::string decrypt_gcm(const std::string &encrypted_format,
   plaintext_len += len;
   plaintext.resize(static_cast<size_t>(plaintext_len));
 
-  return std::string(plaintext.begin(), plaintext.end());
+  std::string out(plaintext.begin(), plaintext.end());
+  wipe_vector(plaintext);
+  return out;
 }
 
 std::string decrypt_dpapi_legacy(const std::string &stored) {
   const std::vector<unsigned char> cipher_bytes = from_hex(stored);
-#ifndef CRYPT_PROTECT_LOCAL_MACHINE
-#define CRYPT_PROTECT_LOCAL_MACHINE 0x00000004
-#endif
   if (auto plain = try_decrypt_dpapi(cipher_bytes, CRYPT_PROTECT_LOCAL_MACHINE)) {
     return *plain;
   }
@@ -224,12 +295,154 @@ std::string decrypt_dpapi_legacy(const std::string &stored) {
       "and restart the service on this machine.");
 }
 
+std::wstring read_machine_guid_w() {
+  wchar_t guid_buf[256]{};
+  DWORD buf_size = sizeof(guid_buf);
+  const LSTATUS status = RegGetValueW(
+      HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Cryptography", L"MachineGuid",
+      RRF_RT_REG_SZ, nullptr, guid_buf, &buf_size);
+  if (status != ERROR_SUCCESS) {
+    wipe_buffer(guid_buf, sizeof(guid_buf));
+    throw std::runtime_error(
+        "derive_machine_key: MachineGuid is unavailable "
+        "(HKLM\\SOFTWARE\\Microsoft\\Cryptography\\MachineGuid). Refusing to "
+        "derive a weak fallback key. LSTATUS=" +
+        std::to_string(status));
+  }
+  std::wstring guid(guid_buf);
+  wipe_buffer(guid_buf, sizeof(guid_buf));
+  return guid;
+}
+
+// Pre-1.2610.191.14 key: SHA256(MachineGuid). Kept for decrypting older blobs.
+std::vector<unsigned char> derive_machine_key_legacy_sha256_guid() {
+  const std::wstring guid_w = read_machine_guid_w();
+  std::string guid = wide_to_utf8(guid_w);
+
+  std::vector<unsigned char> key(SHA256_DIGEST_LENGTH);
+  EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
+  if (!mdctx) {
+    wipe_buffer(guid.data(), guid.size());
+    throw std::runtime_error("EVP_MD_CTX_new failed");
+  }
+
+  if (1 != EVP_DigestInit_ex(mdctx, EVP_sha256(), nullptr) ||
+      1 != EVP_DigestUpdate(mdctx, guid.data(), guid.size()) ||
+      1 != EVP_DigestFinal_ex(mdctx, key.data(), nullptr)) {
+    EVP_MD_CTX_free(mdctx);
+    wipe_buffer(guid.data(), guid.size());
+    wipe_vector(key);
+    throw std::runtime_error("SHA256 calculation failed");
+  }
+  EVP_MD_CTX_free(mdctx);
+  wipe_buffer(guid.data(), guid.size());
+  return key;
+}
+
+std::vector<unsigned char> hmac_sha256(const std::vector<unsigned char> &key,
+                                       const std::vector<unsigned char> &data) {
+  std::vector<unsigned char> out(SHA256_DIGEST_LENGTH);
+  unsigned int out_len = 0;
+  if (HMAC(EVP_sha256(), key.data(), static_cast<int>(key.size()), data.data(),
+           data.size(), out.data(), &out_len) == nullptr) {
+    wipe_vector(out);
+    throw std::runtime_error("HMAC-SHA256 failed");
+  }
+  return out;
+}
+
+fs::path machine_secret_path() {
+  wchar_t buf[MAX_PATH]{};
+  const DWORD n = GetEnvironmentVariableW(L"PROGRAMDATA", buf, MAX_PATH);
+  const std::wstring root =
+      (n > 0 && n < MAX_PATH) ? std::wstring(buf) : std::wstring(L"C:\\ProgramData");
+  return fs::path(root) / L"SBM" / L"crypto" / L"machine_secret.dpapi";
+}
+
+std::vector<unsigned char> load_or_create_machine_secret() {
+  const fs::path path = machine_secret_path();
+  std::error_code ec;
+
+  if (fs::exists(path, ec) && !ec) {
+    std::ifstream ifs(path, std::ios::binary);
+    if (!ifs) {
+      throw std::runtime_error(
+          "Failed to open DPAPI machine secret file: " + path.string());
+    }
+    std::vector<unsigned char> blob((std::istreambuf_iterator<char>(ifs)),
+                                    std::istreambuf_iterator<char>());
+    if (blob.empty()) {
+      throw std::runtime_error("DPAPI machine secret file is empty: " +
+                               path.string());
+    }
+
+    if (auto plain =
+            try_unprotect_dpapi_bytes(blob, CRYPT_PROTECT_LOCAL_MACHINE)) {
+      wipe_vector(blob);
+      return *plain;
+    }
+    if (auto plain = try_unprotect_dpapi_bytes(blob, 0)) {
+      wipe_vector(blob);
+      return *plain;
+    }
+    wipe_vector(blob);
+    throw std::runtime_error(
+        "Failed to unprotect DPAPI machine secret at " + path.string() +
+        ". Delete the file on this machine to regenerate (will invalidate "
+        "credentials encrypted after 1.2610.191.14).");
+  }
+
+  std::vector<unsigned char> secret(KEY_SIZE);
+  if (1 != RAND_bytes(secret.data(), static_cast<int>(secret.size()))) {
+    wipe_vector(secret);
+    throw std::runtime_error("RAND_bytes failed while creating machine secret");
+  }
+
+  std::vector<unsigned char> blob =
+      protect_dpapi_bytes(secret, CRYPT_PROTECT_LOCAL_MACHINE);
+
+  fs::create_directories(path.parent_path(), ec);
+  if (ec) {
+    wipe_vector(secret);
+    wipe_vector(blob);
+    throw std::runtime_error(
+        "Failed to create directory for machine secret: " +
+        path.parent_path().string() + " ec=" + std::to_string(ec.value()));
+  }
+
+  {
+    std::ofstream ofs(path, std::ios::binary | std::ios::trunc);
+    if (!ofs) {
+      wipe_vector(secret);
+      wipe_vector(blob);
+      throw std::runtime_error(
+          "Failed to write DPAPI machine secret file: " + path.string());
+    }
+    ofs.write(reinterpret_cast<const char *>(blob.data()),
+              static_cast<std::streamsize>(blob.size()));
+    if (!ofs) {
+      wipe_vector(secret);
+      wipe_vector(blob);
+      throw std::runtime_error(
+          "Failed while writing DPAPI machine secret file: " + path.string());
+    }
+  }
+  wipe_vector(blob);
+  return secret;
+}
+
+std::string decrypt_aes_with_key(const std::string &encrypted_format,
+                                 const std::vector<unsigned char> &key) {
+  if (encrypted_format.rfind(k_gcm_prefix, 0) == 0) {
+    return decrypt_gcm(encrypted_format, key);
+  }
+  return decrypt_cbc_legacy(encrypted_format, key);
+}
+
 } // namespace
 
 void secure_zero_memory(void *ptr, const size_t size) {
-  if (ptr && size > 0) {
-    SecureZeroMemory(ptr, size);
-  }
+  wipe_buffer(ptr, size);
 }
 
 secure_string::secure_string(std::string s) : data_(std::move(s)) {}
@@ -244,6 +457,9 @@ secure_string::secure_string(const secure_string &other) : data_(other.data_) {}
 
 secure_string &secure_string::operator=(const secure_string &other) {
   if (this != &other) {
+    if (!data_.empty()) {
+      secure_zero_memory(&data_[0], data_.size());
+    }
     data_ = other.data_;
   }
   return *this;
@@ -262,40 +478,83 @@ secure_string &secure_string::operator=(secure_string &&other) noexcept {
   return *this;
 }
 
+secure_wstring::secure_wstring(std::wstring s) : data_(std::move(s)) {}
+
+secure_wstring::~secure_wstring() {
+  if (!data_.empty()) {
+    secure_zero_memory(&data_[0], data_.size() * sizeof(wchar_t));
+  }
+}
+
+secure_wstring::secure_wstring(const secure_wstring &other) : data_(other.data_) {}
+
+secure_wstring &secure_wstring::operator=(const secure_wstring &other) {
+  if (this != &other) {
+    if (!data_.empty()) {
+      secure_zero_memory(&data_[0], data_.size() * sizeof(wchar_t));
+    }
+    data_ = other.data_;
+  }
+  return *this;
+}
+
+secure_wstring::secure_wstring(secure_wstring &&other) noexcept
+    : data_(std::move(other.data_)) {}
+
+secure_wstring &secure_wstring::operator=(secure_wstring &&other) noexcept {
+  if (this != &other) {
+    if (!data_.empty()) {
+      secure_zero_memory(&data_[0], data_.size() * sizeof(wchar_t));
+    }
+    data_ = std::move(other.data_);
+  }
+  return *this;
+}
+
+secure_wstring &secure_wstring::append(const std::wstring_view sv) {
+  data_.append(sv);
+  return *this;
+}
+
+secure_wstring &secure_wstring::append(const wchar_t *p) {
+  if (p) {
+    data_.append(p);
+  }
+  return *this;
+}
+
+secure_wstring &secure_wstring::append(const wchar_t c) {
+  data_.push_back(c);
+  return *this;
+}
+
+void secure_wstring::clear() {
+  if (!data_.empty()) {
+    secure_zero_memory(&data_[0], data_.size() * sizeof(wchar_t));
+  }
+  data_.clear();
+}
+
 std::vector<unsigned char> derive_machine_key() {
-  wchar_t guid_buf[256]{};
-  DWORD buf_size = sizeof(guid_buf);
-  const LSTATUS status = RegGetValueW(
-      HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Cryptography", L"MachineGuid",
-      RRF_RT_REG_SZ, nullptr, guid_buf, &buf_size);
+  // Strengthened key (1.2610.191.14+):
+  //   AES-256 key = HMAC-SHA256(DPAPI LocalMachine secret, MachineGuid_utf8)
+  // Secret file: %PROGRAMDATA%\SBM\crypto\machine_secret.dpapi
+  // Older blobs remain decryptable via SHA256(MachineGuid) fallback in
+  // decrypt_string().
+  const std::wstring guid_w = read_machine_guid_w();
+  std::string guid_utf8 = wide_to_utf8(guid_w);
+  std::vector<unsigned char> guid_bytes(guid_utf8.begin(), guid_utf8.end());
+  wipe_buffer(guid_utf8.data(), guid_utf8.size());
 
-  std::vector<unsigned char> input_material;
-  if (status == ERROR_SUCCESS) {
-    const std::string guid = wide_to_utf8(std::wstring(guid_buf));
-    input_material.assign(guid.begin(), guid.end());
-  } else {
-    throw std::runtime_error(
-        "derive_machine_key: MachineGuid is unavailable "
-        "(HKLM\\SOFTWARE\\Microsoft\\Cryptography\\MachineGuid). Refusing to "
-        "derive a weak fallback key. LSTATUS=" +
-        std::to_string(status));
+  std::vector<unsigned char> secret = load_or_create_machine_secret();
+  std::vector<unsigned char> key = hmac_sha256(secret, guid_bytes);
+  wipe_vector(secret);
+  wipe_vector(guid_bytes);
+
+  if (key.size() != KEY_SIZE) {
+    wipe_vector(key);
+    throw std::runtime_error("derive_machine_key: unexpected HMAC length");
   }
-
-  std::vector<unsigned char> key(SHA256_DIGEST_LENGTH);
-  EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
-  if (!mdctx) {
-    throw std::runtime_error("EVP_MD_CTX_new failed");
-  }
-
-  if (1 != EVP_DigestInit_ex(mdctx, EVP_sha256(), nullptr) ||
-      1 != EVP_DigestUpdate(mdctx, input_material.data(),
-                            input_material.size()) ||
-      1 != EVP_DigestFinal_ex(mdctx, key.data(), nullptr)) {
-    EVP_MD_CTX_free(mdctx);
-    throw std::runtime_error("SHA256 calculation failed");
-  }
-  EVP_MD_CTX_free(mdctx);
-
   return key;
 }
 
@@ -323,7 +582,7 @@ std::string encrypt_string(const std::string &plaintext,
       1 != EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, IV_LEN, nullptr) ||
       1 != EVP_EncryptInit_ex(ctx, nullptr, nullptr, key.data(), iv.data())) {
     EVP_CIPHER_CTX_free(ctx);
-    throw std::runtime_error("EVP_EncryptInit_ex (GCM) failed");
+    throw std::runtime_error("EVP_EncryptInit_ex failed: " + get_openssl_error());
   }
 
   std::vector<unsigned char> ciphertext(plaintext.size() + BLOCK_SIZE);
@@ -336,7 +595,8 @@ std::string encrypt_string(const std::string &plaintext,
                  reinterpret_cast<const unsigned char *>(plaintext.data()),
                  static_cast<int>(plaintext.size()))) {
       EVP_CIPHER_CTX_free(ctx);
-      throw std::runtime_error("EVP_EncryptUpdate failed");
+      throw std::runtime_error("EVP_EncryptUpdate failed: " +
+                               get_openssl_error());
     }
     ciphertext_len = len;
   }
@@ -367,13 +627,27 @@ std::string decrypt_string(const std::string &encrypted_format,
     throw std::invalid_argument("Key size must be 32 bytes (256 bits)");
   }
 
-  if (encrypted_format.rfind(k_gcm_prefix, 0) == 0) {
-    return decrypt_gcm(encrypted_format, key);
+  // Legacy Watchdog DPAPI hex blob (no colon / no gcm: prefix).
+  if (encrypted_format.rfind(k_gcm_prefix, 0) != 0 &&
+      encrypted_format.find(':') == std::string::npos) {
+    return decrypt_dpapi_legacy(encrypted_format);
   }
-  if (encrypted_format.find(':') != std::string::npos) {
-    return decrypt_cbc_legacy(encrypted_format, key);
+
+  try {
+    return decrypt_aes_with_key(encrypted_format, key);
+  } catch (const std::exception &) {
+    // Fall back to pre-1.2610.191.14 SHA256(MachineGuid) key so hosts with
+    // existing ENCRYPTED sql_connection.json keep working after upgrade.
+    std::vector<unsigned char> legacy = derive_machine_key_legacy_sha256_guid();
+    try {
+      std::string plain = decrypt_aes_with_key(encrypted_format, legacy);
+      wipe_vector(legacy);
+      return plain;
+    } catch (...) {
+      wipe_vector(legacy);
+      throw;
+    }
   }
-  return decrypt_dpapi_legacy(encrypted_format);
 }
 
 } // namespace sbm::security

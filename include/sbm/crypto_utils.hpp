@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace sbm::security {
@@ -31,13 +32,56 @@ private:
   std::string data_;
 };
 
+// Wide counterpart for ODBC connection strings and SQL passwords held in memory.
+// Destructor / clear / move-assign zeroize the backing buffer.
+class secure_wstring {
+public:
+  secure_wstring() = default;
+  explicit secure_wstring(std::wstring s);
+  ~secure_wstring();
+
+  secure_wstring(const secure_wstring &other);
+  secure_wstring &operator=(const secure_wstring &other);
+
+  secure_wstring(secure_wstring &&other) noexcept;
+  secure_wstring &operator=(secure_wstring &&other) noexcept;
+
+  secure_wstring &append(std::wstring_view sv);
+  secure_wstring &append(const wchar_t *p);
+  secure_wstring &append(wchar_t c);
+  secure_wstring &operator+=(std::wstring_view sv) { return append(sv); }
+  secure_wstring &operator+=(const wchar_t *p) { return append(p); }
+  secure_wstring &operator+=(wchar_t c) { return append(c); }
+
+  void reserve(size_t n) { data_.reserve(n); }
+  void clear();
+
+  [[nodiscard]] const std::wstring &value() const { return data_; }
+  [[nodiscard]] const wchar_t *c_str() const { return data_.c_str(); }
+  [[nodiscard]] size_t size() const { return data_.size(); }
+  [[nodiscard]] bool empty() const { return data_.empty(); }
+
+  friend bool operator==(const secure_wstring &a, const secure_wstring &b) {
+    return a.data_ == b.data_;
+  }
+  friend bool operator!=(const secure_wstring &a, const secure_wstring &b) {
+    return !(a == b);
+  }
+
+private:
+  std::wstring data_;
+};
+
 std::vector<unsigned char> derive_machine_key();
 
 // Writes AES-256-GCM: "gcm:IV:TAG:CIPHERTEXT" (hex segments).
+// Uses the key from derive_machine_key() (HMAC over a DPAPI LocalMachine secret).
 std::string encrypt_string(const std::string &plaintext,
                            const std::vector<unsigned char> &key);
 
 // Reads GCM, legacy AES-CBC ("IV:CIPHER"), or legacy Watchdog DPAPI (hex blob).
+// For GCM/CBC, if `key` fails authentication, retries once with the legacy
+// SHA256(MachineGuid) key so older on-disk credentials keep decrypting.
 std::string decrypt_string(const std::string &encrypted_format,
                            const std::vector<unsigned char> &key);
 
